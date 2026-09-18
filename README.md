@@ -26,7 +26,8 @@ You can also use the left/right arrow keys in game to
 slowly nudge the size of the highway until it is correctly aligned.
 
 
-This works in fullscreen and windowed.
+This works in fullscreen and windowed. This should work for every version of
+the game that uses chusanApp.exe, but I have only tested version 2.47.
 
 
 ## Building
