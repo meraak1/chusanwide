@@ -64,7 +64,8 @@ static int  g_sceneMeshDraws = 0;
 static int  g_menuFrameRun   = 0;
 
 // How strongly the effect is applied: 1 is full, 0 is off. Switching on is
-// instant. Switching off eases since a hard cut would be visible.
+// instant. Switching off eases since a hard cut would be visible. I didn't
+// really know how to get rid of the cut so this is the lazy way to do it
 static float     g_blend        = 0.0f;
 static const int GATE_HOLD_FRAMES = 15;
 static const int GATE_RAMP_FRAMES = 10;
