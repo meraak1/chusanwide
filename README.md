@@ -2,7 +2,8 @@
 
 Widens the highway to align with your controller without needing
 a 32 inch monitor. This stretches the actual 3D playfield rather than
-just resizing the window (so all UI stays on screen).
+just resizing the window (so all UI stays on screen). It also stretches
+all menu button prompts to align the UI with the controller.
 
 ## Install
 
