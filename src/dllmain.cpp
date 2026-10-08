@@ -1,6 +1,5 @@
 /*
- * How it works
- * ------------
+ * How it works:
  * The game uploads its camera as four consecutive vertex shader constants,
  * column-major, so each register is a row of the matrix and
  * clip.x = dot(register0, vertex). Scaling register 0 by sx scales NDC x
@@ -15,6 +14,11 @@
  * menus that camera is bound for a few background quads and never draws
  * indexed geometry; during a chart, and during the lead-in animation, it
  * draws the lane and the notes.
+ *
+ * Menu button prompts: the controller-aligned prompts at the bottom of the
+ * menus always sit in the same region, so after each frame that strip is
+ * copied out and stretched back in horizontally by the same sx. It eases off
+ * as the field eases on, so it's never active during gameplay.
  *
  * Nothing is pattern-scanned and no addresses are hardcoded
  */
@@ -51,6 +55,7 @@ static float         g_sy      = 1.0f;
 static volatile LONG g_enabled = 1;
 static volatile LONG g_gate    = 1;
 static volatile LONG g_hotkeys = 1;
+static volatile LONG g_menuStretch = 1;
 
 // Which constant register holds the scene camera. Learned the first time a
 // frame contains exactly one camera, that can only be gameplay, then kept
@@ -102,7 +107,8 @@ static void WriteDefaultIni()
     std::string p = IniPath();
     if (GetFileAttributesA(p.c_str()) != INVALID_FILE_ATTRIBUTES) return;
 
-    FILE* f = fopen(p.c_str(), "w");
+    // Binary mode: this was previously text mode so "\r\n" would become "\r\r\n"
+    FILE* f = fopen(p.c_str(), "wb");
     if (!f) return;
     fputs(
         "[chusanwide]\r\n"
@@ -117,6 +123,10 @@ static void WriteDefaultIni()
         "\r\n"
         "; Only widen during gameplay\r\n"
         "gate=1\r\n"
+        "\r\n"
+        "; Stretch the button prompts at the bottom of the menus to line up with the controller\r\n"
+        "menu_stretch=1\r\n"
+        "\r\n"
         "; Left and Right arrow keys adjust sx by 0.005.\r\n"
         "; Set to 0 if you don\'t want this.\r\n"
         "hotkeys=1\r\n"
@@ -153,6 +163,68 @@ static void SaveSx()
     RememberIniStamp();
 }
 
+// This adds new keys to inis created by an old version
+static void AddMissingKey(const char* key, const char* comment, const char* value, const char* afterKey)
+{
+    char probe[8];
+    GetPrivateProfileStringA("chusanwide", key, "\x01", probe, sizeof(probe), IniPath().c_str());
+    if (probe[0] != '\x01') return;                            // already there
+
+    std::string text;
+    FILE* f = fopen(IniPath().c_str(), "rb");
+    if (!f) return;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) text.append(buf, n);
+    fclose(f);
+
+    // Match the old "\r\r\n"
+    const bool doubled = text.find("\r\r\n") != std::string::npos;
+    const char* nl = doubled ? "\r\r\n" : text.find("\r\n") != std::string::npos ? "\r\n" : "\n";
+    std::string insert = std::string("; ") + comment + nl + key + "=" + value + nl;
+
+    // Find the start of the line after the `afterKey=` line.
+    size_t at = std::string::npos;
+    size_t afterLen = strlen(afterKey);
+    for (size_t pos = 0; pos < text.size();) {
+        size_t end = text.find('\n', pos);
+        size_t next = (end == std::string::npos) ? text.size() : end + 1;
+        size_t k = pos;
+        while (k < next && (text[k] == ' ' || text[k] == '\t')) ++k;
+        if (_strnicmp(text.c_str() + k, afterKey, afterLen) == 0) {
+            size_t e = k + afterLen;
+            while (e < next && (text[e] == ' ' || text[e] == '\t')) ++e;
+            if (e < next && text[e] == '=') { at = next; break; }
+        }
+        pos = next;
+    }
+
+    if (at == std::string::npos) {
+        // Line not found (hand-edited ini); let Windows put it in the section.
+        WritePrivateProfileStringA("chusanwide", key, value, IniPath().c_str());
+    } else {
+        if (at == text.size() && !text.empty() && text.back() != '\n') text += nl;
+        if (!doubled) {
+            insert = nl + insert;                               // blank line before
+            if (at < text.size() && text[at] != '\r' && text[at] != '\n')
+                insert += nl;                                   // and after, unless there is one
+        }
+        text.insert(at > text.size() ? text.size() : at, insert);
+
+        std::string tmp = IniPath() + ".tmp";
+        FILE* o = fopen(tmp.c_str(), "wb");
+        if (!o) return;
+        bool ok = fwrite(text.data(), 1, text.size(), o) == text.size();
+        ok = (fclose(o) == 0) && ok;
+        if (!ok || !MoveFileExA(tmp.c_str(), IniPath().c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            DeleteFileA(tmp.c_str());
+            return;
+        }
+    }
+    RememberIniStamp();
+    Note("[chusanwide] added %s to the ini", key);
+}
+
 static float IniFloat(const char* key, float fallback)
 {
     char buf[64] = {}, def[64];
@@ -165,6 +237,9 @@ static float IniFloat(const char* key, float fallback)
 static void LoadIni()
 {
     WriteDefaultIni();
+    AddMissingKey("menu_stretch",
+                  "Stretch the button prompts at the bottom of the menus to line up with the controller",
+                  "1", "gate");
 
     // Fall back to whatever is already loaded rather than to a constant, so a
     // half-written file cannot snap a tuned value back to the default.
@@ -176,11 +251,13 @@ static void LoadIni()
         GetPrivateProfileIntA("chusanwide", "gate", (int)g_gate, IniPath().c_str()) ? 1 : 0);
     InterlockedExchange(&g_hotkeys,
         GetPrivateProfileIntA("chusanwide", "hotkeys", (int)g_hotkeys, IniPath().c_str()) ? 1 : 0);
+    InterlockedExchange(&g_menuStretch,
+        GetPrivateProfileIntA("chusanwide", "menu_stretch", (int)g_menuStretch, IniPath().c_str()) ? 1 : 0);
     g_sceneReg = GetPrivateProfileIntA("chusanwide", "scene_register", g_sceneReg, IniPath().c_str());
 
     RememberIniStamp();
-    Note("[chusanwide] sx=%.4f sy=%.4f enabled=%d gate=%d hotkeys=%d scene_register=%d",
-         g_sx, g_sy, (int)g_enabled, (int)g_gate, (int)g_hotkeys, g_sceneReg);
+    Note("[chusanwide] sx=%.4f sy=%.4f enabled=%d gate=%d menu_stretch=%d hotkeys=%d scene_register=%d",
+         g_sx, g_sy, (int)g_enabled, (int)g_gate, (int)g_menuStretch, (int)g_hotkeys, g_sceneReg);
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +330,96 @@ static HRESULT WINAPI hkDrawIndexed(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t,
     return oDrawIndexed(dev, t, base, minIdx, numV, startIdx, primCount);
 }
 
+// Menu button prompts. The region is 1273x84 centered at the bottom on 1080p
+// Scaled to whatever size the backbuffer really is
+static const float MENU_W = 1273.0f, MENU_H = 84.0f;
+
+typedef HRESULT(WINAPI* tReset)(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
+static tReset oReset = nullptr;
+
+static IDirect3DSurface9* g_menuTmp      = nullptr;
+static bool               g_menuOff      = false;   // gave up, see log
+static bool               g_resetHooked  = false;
+static int                g_menuFailRun  = 0;
+
+static void ReleaseMenuTmp()
+{
+    if (g_menuTmp) { g_menuTmp->Release(); g_menuTmp = nullptr; }
+}
+
+// Our scratch surface lives in the default pool, which has to be released
+// before Reset or the Reset fails.
+static HRESULT WINAPI hkReset(IDirect3DDevice9* dev, D3DPRESENT_PARAMETERS* pp)
+{
+    ReleaseMenuTmp();
+    return oReset(dev, pp);
+}
+
+// Hooked from the live device rather than the dummy one, so it's the right
+// function even if the game's device is an Ex device with its own vtable.
+static void HookReset(IDirect3DDevice9* dev)
+{
+    g_resetHooked = true;
+    void* fn = (*reinterpret_cast<void***>(dev))[16];
+    if (MH_CreateHook(fn, reinterpret_cast<LPVOID>(&hkReset), (LPVOID*)&oReset) != MH_OK ||
+        MH_EnableHook(fn) != MH_OK) {
+        g_menuOff = true;
+        Note("[chusanwide] couldn't hook Reset, menu stretch disabled");
+    }
+}
+
+static void StretchMenu(IDirect3DDevice9* dev)
+{
+    if (g_menuOff ||
+        !InterlockedCompareExchange(&g_menuStretch, 1, 1) ||
+        !InterlockedCompareExchange(&g_enabled, 1, 1)) return;
+
+    // on in the menus, off in gameplay, same easing as the other thing
+    const float s = 1.0f + (g_sx - 1.0f) * (1.0f - g_blend);
+    if (s <= 1.001f) return;
+
+    if (!g_resetHooked) { HookReset(dev); if (g_menuOff) return; }
+
+    IDirect3DSurface9* bb = nullptr;
+    if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb) return;
+    D3DSURFACE_DESC d;
+    bb->GetDesc(&d);
+
+    const int W = (int)d.Width, H = (int)d.Height;
+    const int w = (int)(MENU_W * W / 1920.0f + 0.5f);
+    const int h = (int)(MENU_H * H / 1080.0f + 0.5f);
+    int dw = (int)(w * s + 0.5f);
+    if (dw > W) dw = W;
+
+    RECT src = { (W - w) / 2,  H - h, (W - w) / 2 + w,   H };
+    RECT dst = { (W - dw) / 2, H - h, (W - dw) / 2 + dw, H };
+
+    if (g_menuTmp) {
+        D3DSURFACE_DESC t;
+        g_menuTmp->GetDesc(&t);
+        if ((int)t.Width != w || (int)t.Height != h || t.Format != d.Format) ReleaseMenuTmp();
+    }
+
+    // A surface can't be stretched onto an overlapping part of itself, so
+    // copy the strip out first, then stretch it back in.
+    HRESULT hr = S_OK;
+    if (!g_menuTmp)
+        hr = dev->CreateRenderTarget(w, h, d.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &g_menuTmp, NULL);
+    if (SUCCEEDED(hr)) hr = dev->StretchRect(bb, &src, g_menuTmp, NULL, D3DTEXF_NONE);
+    if (SUCCEEDED(hr)) hr = dev->StretchRect(g_menuTmp, NULL, bb, &dst, D3DTEXF_LINEAR);
+    bb->Release();
+
+    if (SUCCEEDED(hr)) { g_menuFailRun = 0; return; }
+
+    // Expected briefly while the device is lost; persistent means it can't work here.
+    ReleaseMenuTmp();
+    if (++g_menuFailRun == 600) {
+        g_menuOff = true;
+        Note("[chusanwide] menu stretch keeps failing (hr=0x%08X, format %d, msaa %d), disabled",
+             (unsigned)hr, (int)d.Format, (int)d.MultiSampleType);
+    }
+}
+
 static HRESULT WINAPI hkEndScene(IDirect3DDevice9* dev)
 {
     // A frame with a single camera can only be gameplay, so it is a safe
@@ -283,7 +450,9 @@ static HRESULT WINAPI hkEndScene(IDirect3DDevice9* dev)
     g_sceneMeshDraws = 0;
     g_activeProjReg  = -1;
 
-    return oEndScene(dev);
+    HRESULT hr = oEndScene(dev);
+    StretchMenu(dev);
+    return hr;
 }
 
 // ---------------------------------------------------------------------------
